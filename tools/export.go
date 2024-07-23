@@ -30,6 +30,14 @@ func RemovePitId(rootURI string, pitId string) error {
 	return nil
 }
 
+func Map[T, U any](ts []T, f func(T) U) []U {
+    us := make([]U, len(ts))
+    for i := range ts {
+        us[i] = f(ts[i])
+    }
+    return us
+}
+
 func Export(host string, index string, search string, w io.Writer) (int, error) {
 	log.Printf("exporting index %s/%s", host, index)
 	rootURI := fmt.Sprintf("http://%s", host)
@@ -84,7 +92,7 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 		sortFieldQuery = "&sort=_id"
 	}
 
-	pitMap := map[string]interface{}{"pit": pitId, "keep_alive": "1m"}
+	pitMap := map[string]interface{}{"id": pitId, "keep_alive": "1m"}
 	bodyRaw, _ := sjson.Set(search, "pit", pitMap)
 	body = strings.NewReader(bodyRaw)
 	uri := fmt.Sprintf("%s/_search?size=10000%s", rootURI, sortFieldQuery)
@@ -117,7 +125,7 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 			total := gjson.GetBytes(body, "hits.total")
 			if !total.Exists() {
 				RemovePitId(rootURI, pitId)
-				return 0, errors.New("no total")
+				return 0, errors.New("no total" + string(body))
 			}
 			progress = util.NewProgressBarWithTotal(os.Stderr, int(total.Int()))
 		}
@@ -150,7 +158,7 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 		lastItem := hitsArray[len(hitsArray) - 1]
 		lastItemSort := gjson.Get(lastItem.Raw, "sort")
 		uri := fmt.Sprintf("%s/_search?size=10000&sort=%s", rootURI, sortFieldString)
-		postBodyWithSearchAfter, _ := sjson.Set(search, "search_after", lastItemSort.Array())
+		postBodyWithSearchAfter, _ := sjson.Set(search, "search_after", Map(lastItemSort.Array(), func(item gjson.Result) string { return item.String() } ))
 		postBody, _ := sjson.Set(postBodyWithSearchAfter, "pit", pitMap)
 		req, err := http.NewRequest("POST", uri, strings.NewReader(postBody))
         req.Header.Add("Content-Type", "application/json")
