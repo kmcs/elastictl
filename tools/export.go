@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"heckel.io/elastictl/util"
 	"io"
 	"io/ioutil"
@@ -12,6 +13,22 @@ import (
 	"os"
 	"strings"
 )
+
+func RemovePitId(rootURI string, pitId string) error {
+	req, err := http.NewRequest("DELETE", rootURI + "/_pit", strings.NewReader(fmt.Sprintf("{\"id\":\"%s\"}", pitId)))
+    req.Header.Add("Content-Type", "application/json")
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == 200 {
+		return nil
+	}
+	return nil
+}
 
 func Export(host string, index string, search string, w io.Writer) (int, error) {
 	log.Printf("exporting index %s/%s", host, index)
@@ -37,13 +54,8 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 		return 0, err
 	}
 
-	// Initial search request
-	var body io.Reader
-	if search != "" {
-		body = strings.NewReader(search)
-	}
-	uri := fmt.Sprintf("%s/_search?size=10000&scroll=1m", rootIndexURI)
-	req, err = http.NewRequest("POST", uri, body)
+	// create pit
+	req, err = http.NewRequest("POST", rootIndexURI + "/_pit?keep_alive=1m", nil)
     req.Header.Add("Content-Type", "application/json")
 	if err != nil {
 		return 0, err
@@ -52,7 +64,42 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 	if err != nil {
 		return 0, err
 	}
+	rawPitId, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	pitId := gjson.GetBytes(rawPitId, "id").String()
+
+	// Initial search request
+	var body io.Reader
+	if search == "" {
+		search = "{}"
+	}
+	sortQuery := gjson.Get(search, "sort")
+	var sortFieldString string
+	var sortFieldQuery string
+	if ! sortQuery.Exists() {
+		sortFieldString = "_id"
+		sortFieldQuery = "&sort=_id"
+	}
+
+	pitMap := map[string]interface{}{"pit": pitId, "keep_alive": "1m"}
+	bodyRaw, _ := sjson.Set(search, "pit", pitMap)
+	body = strings.NewReader(bodyRaw)
+	uri := fmt.Sprintf("%s/_search?size=10000%s", rootURI, sortFieldQuery)
+	req, err = http.NewRequest("POST", uri, body)
+    req.Header.Add("Content-Type", "application/json")
+	if err != nil {
+		return 0, err
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		RemovePitId(rootURI, pitId)
+		return 0, err
+	}
 	if resp.Body == nil {
+		RemovePitId(rootURI, pitId)
 		return 0, err
 	}
 
@@ -62,27 +109,26 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 	for {
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
+			RemovePitId(rootURI, pitId)
 			return 0, err
 		}
 
 		if progress == nil {
 			total := gjson.GetBytes(body, "hits.total")
 			if !total.Exists() {
+				RemovePitId(rootURI, pitId)
 				return 0, errors.New("no total")
 			}
 			progress = util.NewProgressBarWithTotal(os.Stderr, int(total.Int()))
 		}
 
-		scrollID := gjson.GetBytes(body, "_scroll_id")
-		if !scrollID.Exists() {
-			return 0, errors.New("no scroll id: " + string(body))
-		}
-
 		hits := gjson.GetBytes(body, "hits.hits")
 		if !hits.Exists() || !hits.IsArray() {
+			RemovePitId(rootURI, pitId)
 			return 0, errors.New("no hits: " + string(body))
 		}
 		if len(hits.Array()) == 0 {
+			RemovePitId(rootURI, pitId)
 			break // we're done!
 		}
 
@@ -90,24 +136,37 @@ func Export(host string, index string, search string, w io.Writer) (int, error) 
 			exported++
 			progress.Add(int64(len(hit.Raw)))
 			if _, err := fmt.Fprintln(w, hit.Raw); err != nil {
+				RemovePitId(rootURI, pitId)
 				return 0, err
 			}
 		}
 
-		uri := fmt.Sprintf("%s/_search/scroll", rootURI)
-		postBody := fmt.Sprintf(`{"scroll":"1m","scroll_id":"%s"}`, scrollID.String())
+		hitsArray := hits.Array()
+
+		if (len(hitsArray) < 10000) {
+			RemovePitId(rootURI, pitId)
+			break // we're done!
+		}
+		lastItem := hitsArray[len(hitsArray) - 1]
+		lastItemSort := gjson.Get(lastItem.Raw, "sort")
+		uri := fmt.Sprintf("%s/_search?size=10000&sort=%s", rootURI, sortFieldString)
+		postBodyWithSearchAfter, _ := sjson.Set(search, "search_after", lastItemSort.Array())
+		postBody, _ := sjson.Set(postBodyWithSearchAfter, "pit", pitMap)
 		req, err := http.NewRequest("POST", uri, strings.NewReader(postBody))
         req.Header.Add("Content-Type", "application/json")
 		if err != nil {
+			RemovePitId(rootURI, pitId)
 			return 0, err
 		}
 
 		resp, err = client.Do(req)
 		if err != nil {
+			RemovePitId(rootURI, pitId)
 			return 0, err
 		}
 
 		if resp.Body == nil {
+			RemovePitId(rootURI, pitId)
 			return 0, err
 		}
 	}
